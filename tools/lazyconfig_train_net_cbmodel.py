@@ -1,0 +1,178 @@
+#!/usr/bin/env python
+# Copyright (c) Facebook, Inc. and its affiliates.
+"""
+Training script using the new "LazyConfig" python config files.
+
+This scripts reads a given python config file and runs the training or evaluation.
+It can be used to train any models or dataset as long as they can be
+instantiated by the recursive construction defined in the given config file.
+
+Besides lazy construction of models, dataloader, etc., this scripts expects a
+few common configuration parameters currently defined in "configs/common/train.py".
+To add more complicated training logic, you can easily add other configs
+in the config file and implement a new train_net.py to handle them.
+"""
+import logging
+
+from detectron2.checkpoint import DetectionCheckpointer
+from detectron2.config import LazyConfig, instantiate
+from detectron2.engine import (
+    AMPTrainer,
+    AMPTrainerLDB,
+    SimpleTrainer,
+    default_argument_parser,
+    default_setup,
+    default_writers,
+    hooks,
+    launch,
+)
+from detectron2.engine.defaults import create_ddp_model
+from detectron2.evaluation import inference_on_dataset, print_csv_format, combine_model
+from detectron2.utils import comm
+
+import torch
+from collections import OrderedDict
+
+logger = logging.getLogger("detectron2")
+
+
+def deal_model(cfg, model, original_model):
+    if "evaluator" in cfg.dataloader:
+        ret, avg_feature = combine_model(
+            model, instantiate(cfg.dataloader.test), instantiate(cfg.dataloader.evaluator), original_model
+        )
+        print_csv_format(ret)
+        return ret, avg_feature
+
+
+def do_train(args, cfg):
+    """
+    Args:
+        cfg: an object with the following attributes:
+            model: instantiate to a module
+            dataloader.{train,test}: instantiate to dataloaders
+            dataloader.evaluator: instantiate to evaluator for test set
+            optimizer: instantaite to an optimizer
+            lr_multiplier: instantiate to a fvcore scheduler
+            train: other misc config defined in `configs/common/train.py`, including:
+                output_dir (str)
+                init_checkpoint (str)
+                amp.enabled (bool)
+                max_iter (int)
+                eval_period, log_period (int)
+                device (str)
+                checkpointer (dict)
+                ddp (dict)
+    """
+    model = instantiate(cfg.model)
+    logger = logging.getLogger("detectron2")
+    logger.info("Model:\n{}".format(model))
+    model.to(cfg.train.device)
+
+    cfg.optimizer.params.model = model
+    optim = instantiate(cfg.optimizer)
+    train_loader = instantiate(cfg.dataloader.train)
+
+    model = create_ddp_model(model, **cfg.train.ddp)
+
+    # original_model = instantiate(cfg.model)
+    # original_model.to(cfg.train.device)
+    # original_model = create_ddp_model(original_model, **cfg.train.ddp)
+    original_model = None
+    if args.freeze:    
+        # freeze args.freeze[blocks, patch_embed, cls_token] parameters
+        for n, p in model.named_parameters():
+            if n.endswith(tuple(args.freeze)) or n.startswith(tuple(args.freeze)):
+                continue
+            elif "dbias" in n:
+                continue
+            else:
+                print("freeze_part: ", n)
+                p.requires_grad = False
+    
+
+    trainer = (AMPTrainerLDB if cfg.train.amp.enabled else SimpleTrainer)(model, train_loader, optim, original_model)
+    checkpointer = DetectionCheckpointer(
+        model,
+        cfg.train.output_dir,
+        trainer=trainer,
+    )
+    trainer.register_hooks(
+        [
+            hooks.IterationTimer(),
+            hooks.LRScheduler(scheduler=instantiate(cfg.lr_multiplier)),
+            hooks.PeriodicCheckpointer(checkpointer, **cfg.train.checkpointer)
+            if comm.is_main_process()
+            else None,
+            hooks.EvalHook(cfg.train.eval_period, lambda: do_test(cfg, model, original_model)),
+            hooks.PeriodicWriter(
+                default_writers(cfg.train.output_dir, cfg.train.max_iter),
+                period=cfg.train.log_period,
+            )
+            if comm.is_main_process()
+            else None,
+        ]
+    )
+
+    checkpointer.resume_or_load(cfg.train.init_checkpoint, resume=args.resume)
+    
+    # DetectionCheckpointer(original_model).load(cfg.train.init_checkpoint)
+
+    if args.resume and checkpointer.has_checkpoint():
+        # The checkpoint stores the training iteration that just finished, thus we start
+        # at the next iteration
+        start_iter = trainer.iter + 1
+    else:
+        start_iter = 0
+    trainer.train(start_iter, cfg.train.max_iter)
+
+
+def main(args):
+    cfg = LazyConfig.load(args.config_file)
+    cfg = LazyConfig.apply_overrides(cfg, args.opts)
+    default_setup(cfg, args)
+
+    if args.eval_only:
+        model = instantiate(cfg.model)
+        model.to(cfg.train.device)
+        model = create_ddp_model(model)
+        DetectionCheckpointer(model).load(cfg.train.init_checkpoint)
+        
+        original_model = instantiate(cfg.model)
+        original_model.to(cfg.train.device)
+        original_model = create_ddp_model(original_model)
+        
+        DetectionCheckpointer(original_model).load("output/voc2007_6class_from0/model_final.pth") 
+        # original_model = None
+        # DetectionCheckpointer(original_model).load(cfg.train.init_checkpoint)
+
+        new_state_dict = OrderedDict()
+        model_base = torch.load("output/voc2007_6class_from0/model_final.pth")['model']
+        # model_base = torch.load("model_base0.pth")#['model'] 
+        model_new = model.state_dict()
+        print(get_parameter_number(model))
+
+        for k in list(model_new.keys()):        
+            if k.startswith(tuple(['roi_heads.box_predictor', 'roi_heads.mask_head.predictor'])): 
+                model_base['d0.'+k] = model_new[k]
+            elif "dbias" in k:
+                model_base['d0.'+k] = model_new[k]
+            
+        _, avg_feature = deal_model(cfg, model, original_model)
+        model_base['d0.key'] = avg_feature
+        
+        torch.save(model_base, "model_base0.pth") 
+    else:
+        do_train(args, cfg)
+
+
+if __name__ == "__main__":
+    args = default_argument_parser().parse_args()
+    launch(
+        main,
+        args.num_gpus,
+        num_machines=args.num_machines,
+        machine_rank=args.machine_rank,
+        dist_url=args.dist_url,
+        args=(args,),
+    )
